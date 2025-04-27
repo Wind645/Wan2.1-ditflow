@@ -10,7 +10,7 @@ from einops import rearrange
 from typing import Optional
 from ..modules.attention import flash_attention, WanRMSNorm, rope_apply
 
-class WanSelfAttention(nn.Module):
+class WanSelfAttention_modified(nn.Module):
 
     def __init__(self,
                  dim,
@@ -18,6 +18,7 @@ class WanSelfAttention(nn.Module):
                  window_size=(-1, -1),
                  qk_norm=True,
                  eps=1e-6,
+                 patch_size=2,
                  block_name=None):
         assert dim % num_heads == 0
         super().__init__()
@@ -27,6 +28,10 @@ class WanSelfAttention(nn.Module):
         self.window_size = window_size
         self.qk_norm = qk_norm
         self.eps = eps
+        self.block_name = block_name
+        
+        self.save_features = block_name is not None  # 有block_name才保存特征
+        self.saved_features = None
 
         # layers
         self.q = nn.Linear(dim, dim)
@@ -36,14 +41,15 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         
-        if block_name is not None:
-            self.block_name = block_name
+        if self.block_name is not None:
+            # Only when registered with a block name, the following attr will exist.
             self.inject_kv = False
             self.copy_kv = False
-
+        
             self.query = None
             self.key = None
             self.value = None
+        
 
     def forward(self, x, seq_lens, grid_sizes, freqs):
         r"""
@@ -85,28 +91,20 @@ class WanSelfAttention(nn.Module):
         # output
         x = x.flatten(2)
         x = self.o(x)
+        
+        if self.save_features:
+        
+            f, h, w = grid_sizes[0].tolist() 
+            
+            self.patch_size = patch_size
+            p_h = h // self.patch_size
+            p_w = w // self.patch_size
+            
+            
+            self.saved_features = rearrange(
+                x[-1], "(t h w) d -> t d h w", 
+                t=f, h=p_h, w=p_w
+            )
+        
         return x
     
-class ModuleWithGuidance(torch.nn.Module):
-    def __init__(self, module, h, w, p, block_name, num_frames):
-        """ self.num_frames must be registered separately. """
-        super().__init__()
-        self.module = module
-        
-        self.starting_shape = "(t h w) d"
-        self.h = h
-        self.w = w
-        self.p = p
-        self.block_name = block_name
-        self.num_frames = num_frames
-        
-    def forward(self, *args, **kwargs):
-        out = self.module(*args, **kwargs)
-        p_h = self.h // self.p
-        p_w = self.w // self.p
-        
-        self.saved_features = rearrange(
-            out[-1], f"{self.starting_shape} -> t d h w", t=self.num_frames, h=p_h, w=p_w
-        )
-        
-        return out

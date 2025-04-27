@@ -32,6 +32,7 @@ from .utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
                                get_sampling_sigmas, retrieve_timesteps)
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .guidance_utils.motion_flow_utils import compute_motion_flow
+from .guidance_utils.custom_modules import WanSelfAttention_modified, ModuleWithGuidance
 
 def clean_memory():
     torch.cuda.empty_cache()
@@ -123,7 +124,50 @@ class WanT2V:
             self.model.to(self.device)
 
         self.sample_neg_prompt = config.sample_neg_prompt
+        
+        # GUIDANCE SETUP
+        self.motion_timestep = torch.tensor([0], device='cuda')
+        
+        self.register_guidance(block_idxs=self.config.guidance_blocks)
+        
+        num_guidance_steps = self.config.guidance_timestep_range[0] - self.config.guidance_timestep_range[1] + 1
+        self.lr_range = np.linspace(self.config.lr[0], self.config.lr[1], num_guidance_steps)
+        
+        print("Loading features from motion video")
+        self.motion_latent = self.load_latent()
+        if self.config.loss_type =='flow':
+            self.motion_attn_features = self.load_attn_features()
+        elif self.config.loss_type=='smm':
+            self.motion_orig_features = self.load_features()
+        elif self.config.loss_type=='moft':
+            self.motion_orig_features, self.motion_channels = self.load_features(moft=True)
+        
 
+    def register_guidance(self, block_idxs):
+        """Register guidance blocks to be able to save features in forward pass"""
+        for out_i, block_i in enumerate(self.model.blocks):
+            block_name = f"block_{out_i}"
+            if out_i in block_idxs:
+                self_attn = WanSelfAttention_modified(
+                    block_i.dim,
+                    block_i.num_heads,
+                    block_i.window_size,
+                    block_i.qk_norm,
+                    block_i.eps,
+                    block_name,
+                )
+                self_attn.load_state_dict(block_i.self_attn.state_dict())
+                block_i.self_attn = self_attn
+            else:
+                self_attn = WanSelfAttention_modified(
+                    block_i.dim,
+                    block_i.num_heads,
+                    block_i.window_size,
+                    block_i.qk_norm,
+                    block_i.eps,
+                )
+                self_attn.load_state_dict(block_i.self_attn.state_dict())
+                block_i.self_attn = self_attn
 
     @torch.no_grad()
     def load_latent(self):
@@ -434,61 +478,7 @@ class WanT2V:
         else:
             print("Invalid loss type")
         
-        if mode=="rope":
-            if self.transformer.trainable_rope is None:
-                optimized_rope = torch.stack([self.transformer.init_rope, self.transformer.init_rope], dim=0)
-            else:
-                optimized_rope = self.transformer.trainable_rope
-            
-            optimized_rope = optimized_rope.clone().detach().to(dtype=torch.float32, device=self.device).requires_grad_(True)
-            optimizer = torch.optim.Adam([optimized_rope], lr=lr)
-
-            for step_i in tqdm(range(self.config.optimization_steps)):
-                optimizer.zero_grad()
-
-                total_loss = loss_method(x, t, rope=optimized_rope)
-                
-                if self.config.verbose:
-                    print(f"Loss t={t}: {total_loss.item()}")
-                scaler.scale(total_loss).backward()
-
-                scaler.step(optimizer)
-                scaler.update()
-                clean_memory()
-            
-            self.transformer.trainable_rope = optimized_rope.detach() # Not implemented
-            if self.config.save_embeds:
-                os.makedirs(os.path.join(self.output_path, 'embeds'), exist_ok=True)
-                torch.save(optimized_rope.detach(), os.path.join(self.output_path, 'embeds', f"rope_{t}.pt"))
-            optimized_x = x
-        elif mode == "posemb":
-            if self.transformer.trainable_pos_embedding is None:
-                text_seq_length = self.config.text_seq_length
-                seq_length = self.patches_height * self.patches_width * self.latent_num_frames
-                optimized_emb = self.transformer.init_pos_embedding[:, text_seq_length:(text_seq_length+seq_length)].clone().detach().to(dtype=torch.float32, device=self.device).requires_grad_(True)
-            else:
-                optimized_emb = self.transformer.trainable_pos_embedding.clone().detach().to(dtype=torch.float32, device=self.device).requires_grad_(True)
-
-            optimizer = torch.optim.Adam([optimized_emb], lr=lr)
-
-            for step_i in tqdm(range(self.config.optimization_steps)):
-                optimizer.zero_grad()
-
-                total_loss = loss_method(x, t, pos_emb=optimized_emb)
-
-                if self.config.verbose:
-                    print(f"Loss t={t}: {total_loss.item()}")
-                scaler.scale(total_loss).backward()
-
-                scaler.step(optimizer)
-                scaler.update()
-                clean_memory()
-            self.transformer.trainable_pos_embedding = optimized_emb.detach() # Not implemented
-            if self.config.save_embeds:
-                os.makedirs(os.path.join(self.output_path, 'embeds'), exist_ok=True)
-                torch.save(optimized_emb.detach(), os.path.join(self.output_path, 'embeds', f"posemb_{t}.pt"))
-            optimized_x = x
-        elif mode=="latent":
+        if mode=="latent":
             optimized_x = x.clone().detach().to(dtype=torch.float32).requires_grad_(True)
             optimizer = torch.optim.Adam([optimized_x], lr=lr)
 
@@ -508,6 +498,8 @@ class WanT2V:
                 os.makedirs(os.path.join(self.output_path, 'embeds'), exist_ok=True)
                 torch.save(optimized_x, os.path.join(self.output_path, 'embeds', f"latent_{t}.pt"))
                 
+        else:
+            raise NotImplementedError("Only latent optimization is implemented")    
         self.change_mode(train=False)
         return optimized_x.detach(), optimized_emb, optimized_rope
 
@@ -629,8 +621,51 @@ class WanT2V:
 
             arg_c = {'context': context, 'seq_len': seq_len}
             arg_null = {'context': context_null, 'seq_len': seq_len}
+            
+            arg_motion_c = {'context': self.config["source_prompt"], 'seq_len': seq_len} # Source Prompt not added yet
+            # What is seq_len?
 
-            for _, t in enumerate(tqdm(timesteps)):
+            for i, t in enumerate(tqdm(timesteps)):
+                is_guidance_step = t in self.guidance_schedule
+                
+                # Clear embeddings after guidance phase ?
+                
+                # KV Injection
+                for block_id in self.config.injection_blocks:
+                    module = self.model.blocks[block_id].self_attn
+                    module.inject_kv = False
+                    module.copy_kv = True
+                    
+                if is_guidance_step:
+                    # Store KV from motion video in injection_blocks
+                    noise_m = noise[0].clone().detach().to(dtype=torch.float32).requires_grad_(True)
+                    noisy_latent = sample_scheduler.add_noise(self.motion_latent, noise_m, t)
+                    
+                    with torch.autocast(device_type="cuda", dtype=self.dtype):
+                        self.model(
+                            noisy_latent,
+                            t,
+                            **arg_motion_c,
+                        )
+                
+                    for block_id in self.config.injection_blocks:
+                        module = self.model.blocks[block_id].self_attn
+                        module.inject_kv = True
+                        module.copy_kv = False
+                        
+                # Apply guidance if needed
+                with torch.enable_grad():
+                    if is_guidance_step and self.config.guidance_blocks:
+                        if not self.config.inject_embeds:
+                            latents = self.guidance_step(latents, i, t, 
+                                                                        mode=self.config.guidance_mode, loss_type=self.config.loss_type)
+                        else:
+                            # 🔄 Zero-shot Motion Injection - Load pre-computed embeddings
+                            embeds_path = os.path.join(self.output_path, "embeds")
+                            if self.config.guidance_mode == "latent":
+                                latents = torch.load(os.path.join(embeds_path, f"latent_{t}.pt")).to(dtype=self.dtype, device=self.device)
+                
+                
                 latent_model_input = latents
                 timestep = [t]
 
