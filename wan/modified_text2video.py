@@ -13,11 +13,13 @@ from pathlib import Path
 import torch
 import torch.cuda.amp as amp
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from tqdm import tqdm
 from torchvision.io import read_video
 from torchvision.io import write_video
 from torchvision.transforms import ToPILImage
+from torch.cuda.amp import GradScaler
 from PIL import Image
 import numpy as np
 from diffusers.video_processor import VideoProcessor
@@ -30,6 +32,12 @@ from .utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
                                get_sampling_sigmas, retrieve_timesteps)
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 from .guidance_utils.motion_flow_utils import compute_motion_flow
+
+def clean_memory():
+    torch.cuda.empty_cache()
+    gc.collect()
+    torch.cuda.empty_cache()
+    gc.collect()
 
 class WanT2V:
 

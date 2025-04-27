@@ -1,52 +1,46 @@
-# Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
-# Modified by Zhikai Wang
-# Purpose of modification: add the function of motion guidance
-
-# 标准库导入
-import argparse
-import gc
-import logging
-import math
 import os
-import random
+import argparse
 import sys
-import warnings
 from datetime import datetime
+import logging
 from pathlib import Path
+import shutil
+import warnings
+import math
+
+warnings.filterwarnings('ignore')
+
+import numpy as np
+from PIL import Image
+import torch
+import torch.nn as nn
+import random
+import torch.distributed as dist
+from omegaconf import OmegaConf
+from torch.cuda.amp import GradScaler
+from tqdm import tqdm
+from transformers import logging
+import torch.nn.functional as F
+import imageio
+from torchvision.io import read_video
+from torchvision.transforms import ToPILImage
+from PIL import Image
+from torchvision.io import write_video
+import gc
 from typing import Union, List
 
-# 第三方库导入
-import imageio
-import numpy as np
-import shutil
-import torch
-import torch.distributed as dist
-import torch.nn as nn
-import torch.nn.functional as F
-from omegaconf import OmegaConf
-from PIL import Image
-from torch.cuda.amp import GradScaler
-from torchvision.io import read_video, write_video
-from torchvision.transforms import ToPILImage
-from tqdm import tqdm
-from transformers import logging as trans_logging  # 重命名以避免与标准logging冲突
-
-from diffusers import CogVideoXPipeline, CogVideoXDDIMScheduler, CogVideoXDPMScheduler
 from diffusers.utils import export_to_video
 
-# 本地模块导入
 import wan
 from wan.configs import WAN_CONFIGS, SIZE_CONFIGS, MAX_AREA_CONFIGS, SUPPORTED_SIZES
 from wan.utils.prompt_extend import DashScopePromptExpander, QwenPromptExpander
 from wan.utils.utils import cache_video, cache_image, str2bool
 
-from guidance_utils.custom_transformer import ControlledTransformer
-from guidance_utils.custom_embeddings import prepare_rotary_positional_embeddings
-from guidance_utils.custom_modules import ModuleWithGuidance, InjectionProcessor
-from guidance_utils.motion_flow_utils import compute_motion_flow
+from wan.guidance_utils.custom_modules import ModuleWithGuidance
+from wan.guidance_utils.motion_flow_utils import compute_motion_flow
 
-# 禁用警告
-warnings.filterwarnings('ignore')
+# suppress partial model loading warning
+logging.set_verbosity_error()
 
 EXAMPLE_PROMPT = {
     "t2v-1.3B": {
@@ -73,40 +67,6 @@ EXAMPLE_PROMPT = {
                 "examples/flf2v_input_last_frame.png",
     },
 }
-
-
-def _validate_args(args):
-    # Basic check
-    assert args.ckpt_dir is not None, "Please specify the checkpoint directory."
-    assert args.task in WAN_CONFIGS, f"Unsupport task: {args.task}"
-    assert args.task in EXAMPLE_PROMPT, f"Unsupport task: {args.task}"
-
-    # The default sampling steps are 40 for image-to-video tasks and 50 for text-to-video tasks.
-    if args.sample_steps is None:
-        args.sample_steps = 40 if "i2v" in args.task else 50
-
-    if args.sample_shift is None:
-        args.sample_shift = 5.0
-        if "i2v" in args.task and args.size in ["832*480", "480*832"]:
-            args.sample_shift = 3.0
-        if "flf2v" in args.task:
-            args.sample_shift = 16
-
-    # The default number of frames are 1 for text-to-image tasks and 81 for other tasks.
-    if args.frame_num is None:
-        args.frame_num = 1 if "t2i" in args.task else 81
-
-    # T2I frame_num check
-    if "t2i" in args.task:
-        assert args.frame_num == 1, f"Unsupport frame_num {args.frame_num} for task {args.task}"
-
-    args.base_seed = args.base_seed if args.base_seed >= 0 else random.randint(
-        0, sys.maxsize)
-    # Size check
-    assert args.size in SUPPORTED_SIZES[
-        args.
-        task], f"Unsupport size {args.size} for task {args.task}, supported sizes are: {', '.join(SUPPORTED_SIZES[args.task])}"
-
 
 def _parse_args():
     parser = argparse.ArgumentParser(
@@ -237,41 +197,44 @@ def _parse_args():
         type=float,
         default=5.0,
         help="Classifier free guidance scale.")
-    # options for motion guidance
-    parser.add_argument(
-        "-v", "--video_path", 
-        type=str, required=True, 
-        help="Motion video path to transfer motion from (.mp4 or directory of .png)"
-    )
-    parser.add_argument(
-        "--loss_type", 
-        type=str, default="flow", 
-        choices=["flow", "moft", "smm"], 
-        help="Use MOFT or SMM for guidance"
-    )
-    parser.add_argument(
-        "--no_guidance", 
-        action="store_true", 
-        help="Disable guidance"
-    )
-    parser.add_argument(
-        "--no_injection", 
-        action="store_true", 
-        help="Disable KV injection"
-    )
-    parser.add_argument(
-        "--inject_embeds", 
-        action="store_true", 
-        help="Inject previously trained embeddings in embeds/ into the new generation specified by the prompt argument"
-    )
 
     args = parser.parse_args()
 
     _validate_args(args)
 
     return args
+def _validate_args(args):
+    # Basic check
+    assert args.ckpt_dir is not None, "Please specify the checkpoint directory."
+    assert args.task in WAN_CONFIGS, f"Unsupport task: {args.task}"
+    assert args.task in EXAMPLE_PROMPT, f"Unsupport task: {args.task}"
 
+    # The default sampling steps are 40 for image-to-video tasks and 50 for text-to-video tasks.
+    if args.sample_steps is None:
+        args.sample_steps = 40 if "i2v" in args.task else 50
 
+    if args.sample_shift is None:
+        args.sample_shift = 5.0
+        if "i2v" in args.task and args.size in ["832*480", "480*832"]:
+            args.sample_shift = 3.0
+        if "flf2v" in args.task:
+            args.sample_shift = 16
+
+    # The default number of frames are 1 for text-to-image tasks and 81 for other tasks.
+    if args.frame_num is None:
+        args.frame_num = 1 if "t2i" in args.task else 81
+
+    # T2I frame_num check
+    if "t2i" in args.task:
+        assert args.frame_num == 1, f"Unsupport frame_num {args.frame_num} for task {args.task}"
+
+    args.base_seed = args.base_seed if args.base_seed >= 0 else random.randint(
+        0, sys.maxsize)
+    # Size check
+    assert args.size in SUPPORTED_SIZES[
+        args.
+        task], f"Unsupport size {args.size} for task {args.task}, supported sizes are: {', '.join(SUPPORTED_SIZES[args.task])}"
+    
 def _init_logging(rank):
     # logging
     if rank == 0:
@@ -283,270 +246,49 @@ def _init_logging(rank):
     else:
         logging.basicConfig(level=logging.ERROR)
 
+def isinstance_str(x: object, cls_name: Union[str, List[str]]):
+    """
+    Checks whether x has any class *named* cls_name in its ancestry.
+    Doesn't require access to the class's implementation.
 
-def generate(args):
-    rank = int(os.getenv("RANK", 0))
-    world_size = int(os.getenv("WORLD_SIZE", 1))
-    local_rank = int(os.getenv("LOCAL_RANK", 0))
-    device = local_rank
-    _init_logging(rank)
-
-    if args.offload_model is None:
-        args.offload_model = False if world_size > 1 else True
-        logging.info(
-            f"offload_model is not specified, set to {args.offload_model}.")
-    if world_size > 1:
-        torch.cuda.set_device(local_rank)
-        dist.init_process_group(
-            backend="nccl",
-            init_method="env://",
-            rank=rank,
-            world_size=world_size)
+    Useful for patching!
+    """
+    if type(cls_name) == str:
+        for _cls in x.__class__.__mro__:
+            if _cls.__name__ == cls_name:
+                return True
     else:
-        assert not (
-            args.t5_fsdp or args.dit_fsdp
-        ), f"t5_fsdp and dit_fsdp are not supported in non-distributed environments."
-        assert not (
-            args.ulysses_size > 1 or args.ring_size > 1
-        ), f"context parallel are not supported in non-distributed environments."
+        for _cls in x.__class__.__mro__:
+            if _cls.__name__ in cls_name:
+                return True
+    return False
 
-    if args.ulysses_size > 1 or args.ring_size > 1:
-        assert args.ulysses_size * args.ring_size == world_size, f"The number of ulysses_size and ring_size should be equal to the world size."
-        from xfuser.core.distributed import (initialize_model_parallel,
-                                             init_distributed_environment)
-        init_distributed_environment(
-            rank=dist.get_rank(), world_size=dist.get_world_size())
-
-        initialize_model_parallel(
-            sequence_parallel_degree=dist.get_world_size(),
-            ring_degree=args.ring_size,
-            ulysses_degree=args.ulysses_size,
-        )
-
-    if args.use_prompt_extend:
-        if args.prompt_extend_method == "dashscope":
-            prompt_expander = DashScopePromptExpander(
-                model_name=args.prompt_extend_model, is_vl="i2v" in args.task or "flf2v" in args.task)
-        elif args.prompt_extend_method == "local_qwen":
-            prompt_expander = QwenPromptExpander(
-                model_name=args.prompt_extend_model,
-                is_vl="i2v" in args.task,
-                device=rank)
-        else:
-            raise NotImplementedError(
-                f"Unsupport prompt_extend_method: {args.prompt_extend_method}")
-
-    cfg = WAN_CONFIGS[args.task]
-    if args.ulysses_size > 1:
-        assert cfg.num_heads % args.ulysses_size == 0, f"`{cfg.num_heads=}` cannot be divided evenly by `{args.ulysses_size=}`."
-
-    logging.info(f"Generation job args: {args}")
-    logging.info(f"Generation model config: {cfg}")
-
-    if dist.is_initialized():
-        base_seed = [args.base_seed] if rank == 0 else [None]
-        dist.broadcast_object_list(base_seed, src=0)
-        args.base_seed = base_seed[0]
-
-
-
-    # load the text to video model
-    if "t2v" in args.task or "t2i" in args.task:
-        if args.prompt is None:
-            args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
-        logging.info(f"Input prompt: {args.prompt}")
-        if args.use_prompt_extend:
-            logging.info("Extending prompt ...")
-            if rank == 0:
-                prompt_output = prompt_expander(
-                    args.prompt,
-                    tar_lang=args.prompt_extend_target_lang,
-                    seed=args.base_seed)
-                if prompt_output.status == False:
-                    logging.info(
-                        f"Extending prompt failed: {prompt_output.message}")
-                    logging.info("Falling back to original prompt.")
-                    input_prompt = args.prompt
-                else:
-                    input_prompt = prompt_output.prompt
-                input_prompt = [input_prompt]
-            else:
-                input_prompt = [None]
-            if dist.is_initialized():
-                dist.broadcast_object_list(input_prompt, src=0)
-            args.prompt = input_prompt[0]
-            logging.info(f"Extended prompt: {args.prompt}")
-
-        logging.info("Creating WanT2V pipeline.")
-        wan_t2v = wan.WanT2V(
-            config=cfg,
-            checkpoint_dir=args.ckpt_dir,
-            device_id=device,
-            rank=rank,
-            t5_fsdp=args.t5_fsdp,
-            dit_fsdp=args.dit_fsdp,
-            use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
-            t5_cpu=args.t5_cpu,
-        )
-
-        logging.info(
-            f"Generating {'image' if 't2i' in args.task else 'video'} ...")
-        video = wan_t2v.generate(
-            args.prompt,
-            size=SIZE_CONFIGS[args.size],
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
-
-    elif "i2v" in args.task:
-        if args.prompt is None:
-            args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
-        if args.image is None:
-            args.image = EXAMPLE_PROMPT[args.task]["image"]
-        logging.info(f"Input prompt: {args.prompt}")
-        logging.info(f"Input image: {args.image}")
-
-        img = Image.open(args.image).convert("RGB")
-        if args.use_prompt_extend:
-            logging.info("Extending prompt ...")
-            if rank == 0:
-                prompt_output = prompt_expander(
-                    args.prompt,
-                    tar_lang=args.prompt_extend_target_lang,
-                    image=img,
-                    seed=args.base_seed)
-                if prompt_output.status == False:
-                    logging.info(
-                        f"Extending prompt failed: {prompt_output.message}")
-                    logging.info("Falling back to original prompt.")
-                    input_prompt = args.prompt
-                else:
-                    input_prompt = prompt_output.prompt
-                input_prompt = [input_prompt]
-            else:
-                input_prompt = [None]
-            if dist.is_initialized():
-                dist.broadcast_object_list(input_prompt, src=0)
-            args.prompt = input_prompt[0]
-            logging.info(f"Extended prompt: {args.prompt}")
-
-        logging.info("Creating WanI2V pipeline.")
-        wan_i2v = wan.WanI2V(
-            config=cfg,
-            checkpoint_dir=args.ckpt_dir,
-            device_id=device,
-            rank=rank,
-            t5_fsdp=args.t5_fsdp,
-            dit_fsdp=args.dit_fsdp,
-            use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
-            t5_cpu=args.t5_cpu,
-        )
-
-        logging.info("Generating video ...")
-        video = wan_i2v.generate(
-            args.prompt,
-            img,
-            max_area=MAX_AREA_CONFIGS[args.size],
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model)
+def clean_memory():
+    torch.cuda.empty_cache()
+    gc.collect()
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+def get_timesteps(timesteps, guidance_timestep_range, skip_timesteps=1):
+    max_guidance_timestep, min_guidance_timestep = guidance_timestep_range
+    num_inference_steps = len(timesteps)
+    init_timestep = min(max_guidance_timestep, num_inference_steps)
+    t_start = max(num_inference_steps - init_timestep, 0)
+    t_end = min_guidance_timestep
+    if t_end > 0:
+        guidance_schedule = timesteps[t_start : -t_end : skip_timesteps]
     else:
-        if args.prompt is None:
-            args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
-        if args.first_frame is None or args.last_frame is None:
-            args.first_frame = EXAMPLE_PROMPT[args.task]["first_frame"]
-            args.last_frame = EXAMPLE_PROMPT[args.task]["last_frame"]
-        logging.info(f"Input prompt: {args.prompt}")
-        logging.info(f"Input first frame: {args.first_frame}")
-        logging.info(f"Input last frame: {args.last_frame}")
-        first_frame = Image.open(args.first_frame).convert("RGB")
-        last_frame = Image.open(args.last_frame).convert("RGB")
-        if args.use_prompt_extend:
-            logging.info("Extending prompt ...")
-            if rank == 0:
-                prompt_output = prompt_expander(
-                    args.prompt,
-                    tar_lang=args.prompt_extend_target_lang,
-                    image=[first_frame, last_frame],
-                    seed=args.base_seed)
-                if prompt_output.status == False:
-                    logging.info(
-                        f"Extending prompt failed: {prompt_output.message}")
-                    logging.info("Falling back to original prompt.")
-                    input_prompt = args.prompt
-                else:
-                    input_prompt = prompt_output.prompt
-                input_prompt = [input_prompt]
-            else:
-                input_prompt = [None]
-            if dist.is_initialized():
-                dist.broadcast_object_list(input_prompt, src=0)
-            args.prompt = input_prompt[0]
-            logging.info(f"Extended prompt: {args.prompt}")
+        guidance_schedule = timesteps[t_start::skip_timesteps]
+    return guidance_schedule
 
-        logging.info("Creating WanFLF2V pipeline.")
-        wan_flf2v = wan.WanFLF2V(
-            config=cfg,
-            checkpoint_dir=args.ckpt_dir,
-            device_id=device,
-            rank=rank,
-            t5_fsdp=args.t5_fsdp,
-            dit_fsdp=args.dit_fsdp,
-            use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
-            t5_cpu=args.t5_cpu,
-        )
-
-        logging.info("Generating video ...")
-        video = wan_flf2v.generate(
-            args.prompt,
-            first_frame,
-            last_frame,
-            max_area=MAX_AREA_CONFIGS[args.size],
-            frame_num=args.frame_num,
-            shift=args.sample_shift,
-            sample_solver=args.sample_solver,
-            sampling_steps=args.sample_steps,
-            guide_scale=args.sample_guide_scale,
-            seed=args.base_seed,
-            offload_model=args.offload_model
-        )
-
-    if rank == 0:
-        if args.save_file is None:
-            formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-            formatted_prompt = args.prompt.replace(" ", "_").replace("/",
-                                                                     "_")[:50]
-            suffix = '.png' if "t2i" in args.task else '.mp4'
-            args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}" + suffix
-
-        if "t2i" in args.task:
-            logging.info(f"Saving generated image to {args.save_file}")
-            cache_image(
-                tensor=video.squeeze(1)[None],
-                save_file=args.save_file,
-                nrow=1,
-                normalize=True,
-                value_range=(-1, 1))
-        else:
-            logging.info(f"Saving generated video to {args.save_file}")
-            cache_video(
-                tensor=video[None],
-                save_file=args.save_file,
-                fps=cfg.sample_fps,
-                nrow=1,
-                normalize=True,
-                value_range=(-1, 1))
-    logging.info("Finished.")
-
-
-if __name__ == "__main__":
-    args = _parse_args()
-    generate(args)
+class Guidance(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.device = torch.device(config["device"])
+        self.eta=0
+        self.batch_size = 1
+        self.num_inference_steps = config["num_inference_steps"]
+        self._guidance_scale = self.config.guidance_scale
+        
+    
