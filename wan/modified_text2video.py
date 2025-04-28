@@ -52,6 +52,7 @@ class WanT2V:
         dit_fsdp=False,
         use_usp=False,
         t5_cpu=False,
+        size=(1280, 720)
     ):
         r"""
         Initializes the Wan text-to-video generation model components.
@@ -81,6 +82,7 @@ class WanT2V:
 
         self.num_train_timesteps = config.num_train_timesteps
         self.param_dtype = config.param_dtype
+        self.size = size
 
         shard_fn = partial(shard_model, device_id=device_id)
         self.text_encoder = T5EncoderModel(
@@ -459,8 +461,8 @@ class WanT2V:
         loss_type: flow, moft, smm (loss computation)
         """
         for block_id in self.config.guidance_blocks:
-            self.transformer.transformer_blocks[block_id].self_attn.inject_kv = False
-            self.transformer.transformer_blocks[block_id].self_attn.copy_kv = True
+            self.model.blocks[block_id].self_attn.inject_kv = False
+            self.model.blocks[block_id].self_attn.copy_kv = True
         
         lr = self.lr_range[i]
         optimized_emb = None
